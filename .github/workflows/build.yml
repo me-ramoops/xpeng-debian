@@ -1,0 +1,126 @@
+name: Build xpeng Debian
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  KERNEL_URL: https://github.com/me-ramoops/linux-sm8350.git
+  KERNEL_REF: sm8350/latest
+  DEB_SUITE: bookworm
+  DEB_ARCH: arm64
+  CONSOLE: ttyMSM0,115200n8
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -yqq
+          sudo apt-get install -yqq bc bison busybox-static cpio debootstrap device-tree-compiler flex gcc-aarch64-linux-gnu git gzip libssl-dev make openssh-client python3 qemu-user-static xz-utils zstd
+
+      - name: Build kernel
+        run: |
+          set -euxo pipefail
+          git clone --depth=1 --branch "$KERNEL_REF" "$KERNEL_URL" kernel
+          make -C kernel ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
+          (cd kernel && scripts/kconfig/merge_config.sh -m .config arch/arm64/configs/xpeng.config)
+          make -C kernel ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+          make -C kernel ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" Image dtbs
+          test -s kernel/arch/arm64/boot/Image
+          make -C kernel ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -s kernelrelease | tee kernel-release.txt
+
+      - name: Build Debian rootfs
+        run: |
+          set -euxo pipefail
+          sudo rm -rf rootfs
+          sudo debootstrap --arch="$DEB_ARCH" --foreign --include=openssh-server "$DEB_SUITE" rootfs
+          sudo cp /usr/bin/qemu-aarch64-static rootfs/usr/bin/
+          sudo chroot rootfs /debootstrap/debootstrap --second-stage
+          echo xpeng | sudo tee rootfs/etc/hostname
+          printf '127.0.0.1 localhost\n127.0.1.1 xpeng\n' | sudo tee rootfs/etc/hosts
+          sudo chroot rootfs sh -c "echo root:toor | chpasswd"
+          sudo chroot rootfs ssh-keygen -A
+          sudo chroot rootfs systemctl enable ssh || true
+          printf 'PermitRootLogin yes\n' | sudo tee rootfs/etc/ssh/sshd_config.d/root.conf
+          sudo tee rootfs/usr/local/sbin/usb-gadget.sh > /dev/null <<'GADGET'
+          #!/bin/sh
+          G=/sys/kernel/config/usb_gadget/xpeng
+          if [ ! -e "$G" ]; then
+            mkdir -p "$G/strings/0x409" "$G/functions/rndis.usb0" "$G/configs/c.1/strings/0x409"
+            echo 0x22b8 > "$G/idVendor"
+            echo 0x2e82 > "$G/idProduct"
+            echo motorola > "$G/strings/0x409/manufacturer"
+            echo xpeng > "$G/strings/0x409/product"
+            echo "02:00:29:25:2b:82" > "$G/functions/rndis.usb0/dev_addr"
+            echo "02:00:29:25:2b:83" > "$G/functions/rndis.usb0/host_addr"
+            ln -sf "$G/functions/rndis.usb0" "$G/configs/c.1/"
+            UDC=$(ls /sys/class/udc 2>/dev/null | head -n 1)
+            if [ -n "$UDC" ]; then echo "$UDC" > "$G/UDC"; fi
+          fi
+          ip addr add 192.168.42.2/24 dev usb0 2>/dev/null || true
+          ip link set usb0 up
+          GADGET
+          sudo chmod +x rootfs/usr/local/sbin/usb-gadget.sh
+          sudo tee rootfs/etc/systemd/system/usb-gadget.service > /dev/null <<'UNIT'
+          [Unit]
+          Description=RNDIS USB gadget for xpeng
+          RequiresMountsFor=/sys/kernel/config
+          After=sys-kernel-config.mount network-pre.target
+          Before=network.target
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/usr/local/sbin/usb-gadget.sh
+
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+          sudo chroot rootfs systemctl enable usb-gadget || true
+          sudo rm -f rootfs/usr/bin/qemu-aarch64-static
+
+      - name: Pack RAM-boot image
+        run: |
+          set -euxo pipefail
+          sudo tee rootfs/init > /dev/null <<'INIT'
+          #!/bin/sh
+          mount -t proc none /proc
+          mount -t sysfs none /sys
+          mount -t devtmpfs none /dev
+          echo "=== xpeng Debian ramdisk boot ==="
+          exec /sbin/init
+          INIT
+          sudo chmod +x rootfs/init
+          sudo sh -c 'cd rootfs && find . -print0 | cpio --quiet -o -H newc --null | gzip -9 > ../ramdisk-boot.cpio.gz'
+          sudo chown "$(id -u):$(id -g)" ramdisk-boot.cpio.gz
+          test -s ramdisk-boot.cpio.gz
+          mkdir -p mkboot/gki
+          curl -sL --max-time 120 -o mkboot/mkbootimg.py "https://raw.githubusercontent.com/LineageOS/android_system_tools_mkbootimg/lineage-22.2/mkbootimg.py"
+          curl -sL --max-time 120 -o mkboot/gki/generate_gki_certificate.py "https://raw.githubusercontent.com/LineageOS/android_system_tools_mkbootimg/lineage-22.2/gki/generate_gki_certificate.py"
+          python3 mkboot/mkbootimg.py --header_version 3 \
+            --kernel kernel/arch/arm64/boot/Image \
+            --ramdisk ramdisk-boot.cpio.gz \
+            --cmdline "console=$CONSOLE rw" \
+            --os_version 17.0.0 --os_patch_level 2026-10 \
+            -o xpeng-debian-boot.img
+          test -s xpeng-debian-boot.img
+          ls -la xpeng-debian-boot.img
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: xpeng-debian
+          path: |
+            xpeng-debian-boot.img
+            kernel-release.txt
+          if-no-files-found: error
