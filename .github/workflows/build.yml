@@ -28,22 +28,20 @@ jobs:
           sudo apt-get update -yqq
           sudo apt-get install -yqq bc bison busybox-static cpio debootstrap device-tree-compiler flex gcc-aarch64-linux-gnu git gzip libssl-dev make openssh-client python3 qemu-user-static xz-utils zstd
 
-      - name: Build kernel
+      - name: Fetch kernel
         run: |
           set -euxo pipefail
-          git clone --depth=1 --branch "$KERNEL_REF" "$KERNEL_URL" kernel
-          make -C kernel ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
-          (cd kernel && scripts/kconfig/merge_config.sh -m .config arch/arm64/configs/xpeng.config)
-          make -C kernel ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
-          make -C kernel ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" Image dtbs
-          test -s kernel/arch/arm64/boot/Image
-          make -C kernel ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -s kernelrelease | tee kernel-release.txt
+          RID=$(gh run list --repo me-ramoops/linux-sm8350 --branch sm8350/latest --status success --limit 1 --json databaseId --jq '.[0].databaseId')
+          gh run download "$RID" --repo me-ramoops/linux-sm8350 --pattern "sm8350-xpeng-kernel" --dir kci
+          test -s kci/sm8350-xpeng-kernel/Image
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build Debian rootfs
         run: |
           set -euxo pipefail
           sudo rm -rf rootfs
-          sudo debootstrap --arch="$DEB_ARCH" --foreign --include=openssh-server "$DEB_SUITE" rootfs
+          sudo debootstrap --variant=minbase --arch="$DEB_ARCH" --foreign --include=openssh-server "$DEB_SUITE" rootfs
           sudo cp /usr/bin/qemu-aarch64-static rootfs/usr/bin/
           sudo chroot rootfs /debootstrap/debootstrap --second-stage
           echo xpeng | sudo tee rootfs/etc/hostname
@@ -108,7 +106,7 @@ jobs:
           curl -sL --max-time 120 -o mkboot/mkbootimg.py "https://raw.githubusercontent.com/LineageOS/android_system_tools_mkbootimg/lineage-22.2/mkbootimg.py"
           curl -sL --max-time 120 -o mkboot/gki/generate_gki_certificate.py "https://raw.githubusercontent.com/LineageOS/android_system_tools_mkbootimg/lineage-22.2/gki/generate_gki_certificate.py"
           python3 mkboot/mkbootimg.py --header_version 3 \
-            --kernel kernel/arch/arm64/boot/Image \
+            --kernel kci/sm8350-xpeng-kernel/Image \
             --ramdisk ramdisk-boot.cpio.gz \
             --cmdline "console=$CONSOLE rw" \
             --os_version 17.0.0 --os_patch_level 2026-10 \
@@ -122,5 +120,4 @@ jobs:
           name: xpeng-debian
           path: |
             xpeng-debian-boot.img
-            kernel-release.txt
           if-no-files-found: error
